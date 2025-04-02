@@ -1,16 +1,20 @@
-import torch
 import numpy as np
 import pandas as pd
 import chess
 import re
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
 
 #Chess columns are notated by a-h, but matrix is noted by #s. Will be used to translate chess columns to matrix equivalent
 letter_to_num = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7}
 num_to_letter = {0: 'a', 1: 'b', 2: 'c', 3: 'd', 4: 'e', 5: 'f', 6: 'g', 7: 'h'}
 
 #We utilize a CNN as it can process 3D information which is vital to both specify location and importance of a chess piece
-
-
 
 
 def create_rep_layer(board, piece):
@@ -66,16 +70,196 @@ def move_to_rep(move, board):
 
     return np.stack([from_output_layer, to_output_layer])
 
+def create_move_list(s):
+    return re.sub(r'\d*\. ', '', s).split(' ')[:-1]
+
+def test_board_methods():
+    board = chess.Board()
+
+    print(board)
+    matrix_board = board_to_matrix(board)
+    print(matrix_board)
+
+    x = move_to_rep("e4", board)
+    board.push_san("e4")
+
+    print(x)
+
+    print(board)
+
+    moves_str1 = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"
+
+    print(create_move_list(moves_str1))
+
+    moves_str2 = "1. e4 c5 2. Nf3 d6 3. d4 cxd4"
+
+    print(create_move_list(moves_str2))
+
+#test_board_methods()
+
+class ChessDataset(Dataset):
+
+    def __init__(self, games):
+        super(ChessDataset, self).__init__()
+        self.games = games
+
+    def __len__(self):
+        return 40_000
+
+    def __getitem__(self, index):
+        game_i = np.random.randint(self.games.shape[0])
+        random_game = chess_data['AN'].values[game_i]
+        moves = create_move_list(random_game)
+        game_state_i = np.random.randint(len(moves) - 1)
+        next_move = moves[game_state_i]
+        moves = moves[:game_state_i]
+        board = chess.Board()
+        for move in moves:
+            board.push_san(move)
+        x = board_to_matrix(board)
+        y = move_to_rep(next_move, board)
+        if game_state_i % 2 == 1:
+            x *= -1
+        return x,y
 
 
 
 
+#The CNN!
 
-board = chess.Board()
+class module(nn.Module):
 
-print(board)
-matrix_board = board_to_matrix(board)
-print(matrix_board)
+    def __init__(self, hidden_size):
+
+        super(module, self).__init__()
+        #Two convolutional layers
+        self.conv1 = nn.Conv2d(hidden_size, hidden_size, 3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(hidden_size, hidden_size, 3, stride=1, padding=1)
+
+        #Two batch normalization layers
+        self.bn1 = nn.BatchNorm2d(hidden_size)
+        self.bn2 = nn.BatchNorm2d(hidden_size)
+
+        #Two SELU activation layers
+        self.activation1 = nn.SELU()
+        self.activation2 = nn.SELU()
+
+    def forward(self, x):
+        x_input = torch.clone(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.activation1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x += x_input
+
+        x = self.activation2(x)
+
+        return x
+
+class chessBot(nn.Module):
+
+    def __init__(self, hidden_layers = 4, hidden_size=200):
+        super(chessBot, self).__init__()
+        self.hidden_layers = hidden_layers
+        self.hidden_size = hidden_size
+        self.input_layer = nn.Conv2d(6, hidden_size, 3, stride=1, padding=1)
+        self.module_list = nn.ModuleList([module(hidden_size) for i in range(hidden_layers)])
+        self.output_layer = nn.Conv2d(hidden_size, 2, 3, stride=1, padding=1)
+
+    def forward(self, x):
+
+        x = self.input_layer(x)
+        x = F.relu(x)
+
+        for i in range(self.input_layer):
+            x = self.module_list[i](x)
+
+        x = self.output_layer(x)
+
+        return x
+
+#Helper functions to decide moves
+
+def check_mate_single(board):
+    board = board.copy()
+    legal_moves = list(board.legal_moves)
+
+    for move in legal_moves:
+        board.push_uci(str(move))
+        if board.is_checkmate():
+            move = board.pop()
+            return move
+        board.pop()
+
+def distribution_over_moves(vals):
+    probs = np.array(vals)
+    probs = np.exp(probs)
+    probs = probs / probs.sum()
+
+    probs = probs ** 3
+    probs = probs / probs.sum()
+
+    return probs
+
+def pred_to_move(move, board):
+#     move = move[0]
+
+    legal_moves = list(board.legal_moves)
+
+    check_mate = check_mate_single(board)
+
+    if check_mate is not None:
+        return check_mate
+
+    vals = []
+    froms = [str(legal_move)[:2] for legal_move in legal_moves]
+    froms = list(set(froms))
+
+    for from_ in froms:
+        row = 8 - int(from_[1])
+        col = letter_to_num[from_[0]]
+        val = move[0, row, col].detach().cpu().numpy()
+        vals.append(val)
+
+    probs = distribution_over_moves(vals)
+    chosen_from = str(np.random.choice(froms, size=1, p=probs)[0])[:2]
+
+    vals = []
+    for legal_move in legal_moves:
+        from_ = str(legal_move)[:2]
+        if from_ == chosen_from:
+            to = str(legal_move)[2:]
+            r = 8 - int(to[1])
+            c = letter_to_num[to[0]]
+            val = move[1, r, c].detach().cpu().numpy()
+            vals.append(val)
+        else:
+            vals.append(0)
+
+    chosen_move = legal_moves[np.argmax(vals)]
+    return chosen_move
+
+#read data
+chess_data = pd.read_csv('chess_games.csv', usecols=['AN', 'WhiteElo']) #Only columns needed
+
+#Filter the data to only games w/ players above 2000 elo, only save moves and of games where there are a lot of moves(?)
+chess_data = chess_data[chess_data['WhiteElo'] > 2000]
+chess_data = chess_data[['AN']]
+chess_data = chess_data[~chess_data['AN'].str.contains('{')]
+chess_data = chess_data[chess_data['AN'].str.len() > 20]
+
+train_size = int(0.8 * len(chess_data))
+test_size = len(chess_data) - train_size
+train_dataset, test_dataset = torch.utils.data.random_split(chess_data, [train_size, test_size])
+
+data_train = ChessDataset(train_dataset)
+data_test = ChessDataset(test_dataset)
+
+data_train_loader = DataLoader(data_train, batch_size=32, shuffle=True, drop_last=True)
+data_test_loader = DataLoader(data_test, batch_size=32, shuffle=True, drop_last=True)
+
 
 
 
