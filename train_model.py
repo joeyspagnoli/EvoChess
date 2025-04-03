@@ -99,15 +99,16 @@ def test_board_methods():
 
 class ChessDataset(Dataset):
 
-    def __init__(self, games):
+    def __init__(self, games, return_board=False):
         super(ChessDataset, self).__init__()
         self.games = games
+        self.return_board = return_board
 
     def __len__(self):
         return 40_000
 
     def __getitem__(self, index):
-        game_i = np.random.randint(self.games.shape[0])
+        game_i = np.random.randint(len(self.games))
         random_game = chess_data['AN'].values[game_i]
         moves = create_move_list(random_game)
         game_state_i = np.random.randint(len(moves) - 1)
@@ -120,7 +121,10 @@ class ChessDataset(Dataset):
         y = move_to_rep(next_move, board)
         if game_state_i % 2 == 1:
             x *= -1
-        return x,y
+        if self.return_board:
+            return x, y, board
+        else:
+            return x, y
 
 
 
@@ -173,8 +177,8 @@ class chessBot(nn.Module):
         x = self.input_layer(x)
         x = F.relu(x)
 
-        for i in range(self.input_layer):
-            x = self.module_list[i](x)
+        for module in self.module_list:
+            x = module(x)
 
         x = self.output_layer(x)
 
@@ -241,24 +245,158 @@ def pred_to_move(move, board):
     chosen_move = legal_moves[np.argmax(vals)]
     return chosen_move
 
-#read data
-chess_data = pd.read_csv('chess_games.csv', usecols=['AN', 'WhiteElo']) #Only columns needed
+def custom_collate(batch):
+    board_states, correct_moves, boards = zip(*batch)
+    board_states = torch.stack([torch.tensor(x) for x in board_states])
+    correct_moves = torch.stack([torch.tensor(x) for x in correct_moves])
+    # Leave boards as a tuple of chess.Board objects
+    return board_states, correct_moves, boards
 
-#Filter the data to only games w/ players above 2000 elo, only save moves and of games where there are a lot of moves(?)
-chess_data = chess_data[chess_data['WhiteElo'] > 2000]
-chess_data = chess_data[['AN']]
-chess_data = chess_data[~chess_data['AN'].str.contains('{')]
-chess_data = chess_data[chess_data['AN'].str.len() > 20]
 
-train_size = int(0.8 * len(chess_data))
-test_size = len(chess_data) - train_size
-train_dataset, test_dataset = torch.utils.data.random_split(chess_data, [train_size, test_size])
+def train_loop(dataloader, model, metric_from, metric_to, optimizer):
+    size = len(dataloader.dataset)
 
-data_train = ChessDataset(train_dataset)
-data_test = ChessDataset(test_dataset)
+    model.train()
+    for batch, (board_state, correct_move) in enumerate(dataloader):
 
-data_train_loader = DataLoader(data_train, batch_size=32, shuffle=True, drop_last=True)
-data_test_loader = DataLoader(data_test, batch_size=32, shuffle=True, drop_last=True)
+        board_state, correct_move = board_state.to(device), correct_move.to(device)
+
+        # Compute prediction and loss
+        pred = model(board_state.float())
+
+        loss = metric_from(pred[:,0,:,:], correct_move[:,0,:,:]) + metric_to(pred[:,1,:,:], correct_move[:,1,:,:])
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if batch % 1000 == 0:
+            loss, current = loss.item(), batch * batch_size + len(board_state)
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+def test_loop(dataloader, model):
+
+    num_guesses = 0
+    correct = 0
+    batch_number = 0
+
+    model.eval()
+
+    with torch.no_grad():
+        for board_state, correct_move, boards in dataloader:
+
+            board_state, correct_move = board_state.to(device), correct_move.to(device)
+
+            preds = model(board_state.float())
+
+#             print("new batch of predictions, batch number: ", batch_number)
+            for i, pred in enumerate(preds):
+                board_obj = boards[i]
+                UCI = pred_to_move(pred, board_obj)
+                san_move = board_obj.san(UCI)
+
+                matrix_move = move_to_rep(san_move, board_obj)   # get one prediction
+                correct_move_np = correct_move[i].cpu().numpy()    # get the corresponding correct move
+
+                if np.array_equal(matrix_move, correct_move_np):
+                    correct += 1
+
+                num_guesses += 1
+#             print("num correct", correct)
+#             print(" ")
+
+    print("number of total guesses: ", num_guesses)
+    print("number of correct guesses: ", correct)
+    print("accuracy: ", (correct/num_guesses)*100)
+
+
+
+def get_ai_move(board, model, device):
+    mat_move = board_to_matrix(board)
+    mat_move = np.expand_dims(mat_move, axis=0)  # Add a batch dimension
+    mat_move_tensor = torch.tensor(mat_move)  # Convert to PyTorch tensor
+    move = model(mat_move_tensor.float().to(device))
+    uci = pred_to_move(move[0], board)
+    return uci
+
+def get_player_move(board):
+    while True:
+        user_move = input("Enter your move (in algebraic notation, e.g., e2e4): ")
+        if user_move in [move.uci() for move in board.legal_moves]:
+            return user_move
+        else:
+            print("Invalid move. Please enter a valid move.")
+
+
+def game_loop():
+    board = chess.Board()
+    print(board)
+
+    while not board.is_game_over():
+        ai_move = get_ai_move(board, model)
+        board.push_uci(str(ai_move))
+        print("AI's move:", ai_move)
+        print(board)
+
+        if board.is_game_over():
+            break
+
+        # Player's move|
+        player_move = get_player_move(board)
+        board.push_uci(str(player_move))
+        print("Player's move:", player_move)
+        print(board)
+
+def train():
+    #read data
+    chess_data = pd.read_csv('chess_games.csv', usecols=['AN', 'WhiteElo']) #Only columns needed
+
+    #Filter the data to only games w/ players above 2000 elo, only save moves and of games where there are a lot of moves(?)
+    chess_data = chess_data[chess_data['WhiteElo'] > 2000]
+    chess_data = chess_data[['AN']]
+    chess_data = chess_data[~chess_data['AN'].str.contains('{')]
+    chess_data = chess_data[chess_data['AN'].str.len() > 20]
+
+    train_size = int(0.8 * len(chess_data))
+    test_size = len(chess_data) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(chess_data, [train_size, test_size])
+
+    data_train = ChessDataset(train_dataset, return_board=False)
+    data_test = ChessDataset(test_dataset, return_board=True)
+
+    data_train_loader = DataLoader(data_train, batch_size=32, shuffle=True, drop_last=True)
+    data_test_loader = DataLoader(data_test, batch_size=32, shuffle=True, drop_last=True, collate_fn=custom_collate)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+
+    model = chessBot().to(device)
+
+    learning_rate = 1e-2
+    batch_size = 32
+
+    metric_from = nn.CrossEntropyLoss()
+    metric_to = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.05)
+
+    epochs = 100
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train_loop(data_train_loader, model, metric_from, metric_to, optimizer)
+        test_loop(data_test_loader, model)
+        if optimizer.param_groups[0]['lr'] > 1e-5:
+            scheduler.step()
+
+    print("Done!")
+
+    torch.save(model.state_dict(), 'model.pth')
+
+
+
+
 
 
 
