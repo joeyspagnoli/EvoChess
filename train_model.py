@@ -320,9 +320,8 @@ def get_ai_move(board, model, device):
     uci = pred_to_move(move[0], board)
     return uci
 
-def get_player_move(board):
+def get_player_move(board, user_move):
     while True:
-        user_move = input("Enter your move (in algebraic notation, e.g., e2e4): ")
         if user_move in [move.uci() for move in board.legal_moves]:
             return user_move
         else:
