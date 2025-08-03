@@ -1,3 +1,5 @@
 /chess_games.csv
 /chess-games.zip
 .venv/
+.vscode/
+__pycache__/
