@@ -8,3 +8,6 @@ __pycache__/
 *.tmp
 .tmp_dagster_home*
 mlruns
+data/
+models/
+mlruns/
