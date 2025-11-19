@@ -1,5 +1,8 @@
 import os
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 from dagster import asset, AssetExecutionContext, MonthlyPartitionsDefinition, Output
 from dagster_aws.s3 import S3Resource
@@ -31,6 +34,53 @@ def s3_object_exists(s3: S3Resource, bucket: str, key: str) -> bool:
             return False
         # Anything else is a real error
         raise
+
+
+def _download_with_retry(
+    url: str, max_retries: int = 5, backoff_factor: float = 2.0
+) -> requests.Response:
+    session = requests.Session()
+
+    # Retry on 429 and 5xx
+    retry = Retry(
+        total=max_retries,
+        read=max_retries,
+        connect=max_retries,
+        status=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,  # let us inspect status code
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    for attempt in range(1, max_retries + 1):
+        resp = session.get(url, stream=True)
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+
+        # 429: Too Many Requests – respect rate limiting
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                sleep_seconds = int(retry_after)
+            except ValueError:
+                sleep_seconds = backoff_factor * attempt
+        else:
+            sleep_seconds = backoff_factor * attempt
+
+        print(
+            f"Got 429 for {url}, attempt {attempt}/{max_retries}, sleeping {sleep_seconds:.1f}s"
+        )
+        time.sleep(sleep_seconds)
+
+    # Final attempt
+    resp = session.get(url, stream=True)
+    resp.raise_for_status()
+    return resp
 
 
 @asset(partitions_def=monthly_partitions)
@@ -77,11 +127,10 @@ def filtered_pgn_zst(context: AssetExecutionContext, s3: S3Resource) -> Output[s
     context.log.info(f"Downloading Lichess data for {url_date} from {file_url}")
 
     try:
-        with requests.get(file_url, stream=True) as r:
-            r.raise_for_status()
-
+        resp = _download_with_retry(file_url, max_retries=5, backoff_factor=2.0)
+        with resp:
             dctx = zstandard.ZstdDecompressor()
-            decompressor = dctx.stream_reader(r.raw)
+            decompressor = dctx.stream_reader(resp.raw)
 
             pgn_stream = io.TextIOWrapper(decompressor, encoding="utf-8")
             game_counter = 0
@@ -362,5 +411,85 @@ def train_evochess_model(
             "mlflow_run_id": run_id,
             "final_test_accuracy": final_test_accuracy,
             "model_path": model_path,
+        },
+    )
+
+
+@asset
+def baseline_evochess_model(
+    context: AssetExecutionContext,
+    s3: S3Resource,
+) -> Output[str]:
+    """
+    Global baseline training:
+
+    - Lists ALL monthly feather chunks in s3://<bucket>/training-feather/
+    - Reads them one by one into DataFrames
+    - Concatenates into a single DataFrame in memory
+    - Calls train(df=..., model_out=...)
+    - Returns the path to the baseline model weights
+    """
+    client = s3.get_client()
+    prefix = "training-feather/"
+
+    context.log.info(f"Listing feather files under s3://{S3_BUCKET_NAME}/{prefix}")
+    resp = client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=prefix)
+    objects = resp.get("Contents", [])
+    feather_keys = [obj["Key"] for obj in objects if obj["Key"].endswith(".feather")]
+
+    if not feather_keys:
+        raise RuntimeError(
+            "No feather files found in S3. "
+            "Run the backfill for training_chunk_feather first."
+        )
+
+    frames = []
+    for key in sorted(feather_keys):  # sorted so months are in order (optional)
+        uri = f"s3://{S3_BUCKET_NAME}/{key}"
+        context.log.info(f"Reading feather file: {uri}")
+
+        obj = client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
+        buf = io.BytesIO(obj["Body"].read())
+        df_chunk = pd.read_feather(buf)
+
+        frames.append(df_chunk)
+
+    full_df = pd.concat(frames, ignore_index=True)
+    context.log.info(
+        f"Combined {len(feather_keys)} feather files into {len(full_df)} rows total."
+    )
+
+    # Prepare output model path
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    from datetime import datetime
+
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
+    model_out = models_dir / f"evochess_baseline_{timestamp}.pt"
+
+    context.log.info(f"Starting global training, baseline model -> {model_out}")
+
+    result = train_evochess(
+        df=full_df,  # <--- use the DataFrame directly
+        model_out=str(model_out),
+    )
+
+    run_id = result.get("run_id")
+    final_test_accuracy = result.get("final_test_accuracy")
+    model_path = result.get("model_path", model_out)
+
+    context.log.info(f"MLflow run_id: {run_id}")
+    context.log.info(f"Final test accuracy: {final_test_accuracy}")
+    context.log.info(f"Baseline model saved at: {model_path}")
+
+    return Output(
+        value=str(model_path),
+        metadata={
+            "num_feather_files": len(feather_keys),
+            "num_rows": len(full_df),
+            "mlflow_run_id": run_id,
+            "final_test_accuracy": final_test_accuracy,
+            "model_path": str(model_path),
         },
     )

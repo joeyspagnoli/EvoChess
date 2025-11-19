@@ -406,17 +406,20 @@ def get_ai_move(board, model, device):
     return uci
 
 
-def train(csv_path="", model_out=""):
+def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = None):
     # read data
-    if not csv_path:
-        print("Invalid csv path")
-        return
+    if df is not None:
+        chess_data = df.copy()
+    else:
+        if not csv_path:
+            print("Invalid csv path")
+            return
 
-    try:
-        chess_data = pd.read_csv(csv_path)
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return
+        try:
+            chess_data = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return
 
     if chess_data.empty:
         print(f"No data found in {csv_path}")
@@ -479,7 +482,7 @@ def train(csv_path="", model_out=""):
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.05)
 
-    last_test_accuracy = None
+    best_test_accuracy = None
 
     with mlflow.start_run() as run:
         # Log static hyperparameters
@@ -509,6 +512,11 @@ def train(csv_path="", model_out=""):
             mlflow.log_metric("train_loss", train_loss, step=t)
             mlflow.log_metric("test_accuracy", test_accuracy, step=t)
 
+            if best_test_accuracy is None or test_accuracy > best_test_accuracy:
+                best_test_accuracy = test_accuracy
+                # Save best model so far
+                torch.save(model.state_dict(), model_out)
+
             if optimizer.param_groups[0]["lr"] > 1e-5:
                 scheduler.step()
 
@@ -519,7 +527,7 @@ def train(csv_path="", model_out=""):
 
         result = {
             "run_id": run.info.run_id,
-            "final_test_accuracy": last_test_accuracy,
+            "final_test_accuracy": best_test_accuracy,
             "model_path": model_out,
         }
 
