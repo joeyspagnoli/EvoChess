@@ -402,15 +402,30 @@ def train_evochess_model(
     context.log.info(f"Final test accuracy: {final_test_accuracy}")
     context.log.info(f"Model saved at: {model_path}")
 
+    # Save to s3
+    client = s3.get_client()
+    s3_key = f"processed-tensors/monthly/evochess_{ym}_{timestamp}.pt"
+
+    context.log.info(f"Uploading model weights to s3://{S3_BUCKET_NAME}/{s3_key}")
+
+    with open(model_path, "rb") as f:
+        client.upload_fileobj(f, S3_BUCKET_NAME, s3_key)
+
+    s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
+    context.log.info(f"✅ Uploaded model to {s3_uri}")
+
     return Output(
-        value=model_path,
+        value=s3_uri,
         metadata={
             "partition_key": partition_key,
             "training_feather_s3_uri": training_chunk_feather,
             "local_csv_path": str(local_csv_path),
             "mlflow_run_id": run_id,
             "final_test_accuracy": final_test_accuracy,
-            "model_path": model_path,
+            "local_model_path": model_path,
+            "s3_model_uri": s3_uri,
+            "s3_bucket": S3_BUCKET_NAME,
+            "s3_key": s3_key,
         },
     )
 
@@ -444,7 +459,7 @@ def baseline_evochess_model(
         )
 
     frames = []
-    for key in sorted(feather_keys):  # sorted so months are in order (optional)
+    for key in sorted(feather_keys):  # sorted so months are in order
         uri = f"s3://{S3_BUCKET_NAME}/{key}"
         context.log.info(f"Reading feather file: {uri}")
 
@@ -459,7 +474,6 @@ def baseline_evochess_model(
         f"Combined {len(feather_keys)} feather files into {len(full_df)} rows total."
     )
 
-    # Prepare output model path
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -471,7 +485,7 @@ def baseline_evochess_model(
     context.log.info(f"Starting global training, baseline model -> {model_out}")
 
     result = train_evochess(
-        df=full_df,  # <--- use the DataFrame directly
+        df=full_df,
         model_out=str(model_out),
     )
 
@@ -483,13 +497,28 @@ def baseline_evochess_model(
     context.log.info(f"Final test accuracy: {final_test_accuracy}")
     context.log.info(f"Baseline model saved at: {model_path}")
 
+    # upload baseline to s3
+    client = s3.get_client()
+    s3_key = f"processed-tensors/baseline/evochess_baseline_{timestamp}.pt"
+
+    context.log.info(f"Uploading baseline model to s3://{S3_BUCKET_NAME}/{s3_key}")
+
+    with open(model_path, "rb") as f:
+        client.upload_fileobj(f, S3_BUCKET_NAME, s3_key)
+
+    s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
+    context.log.info(f"✅ Uploaded baseline model to {s3_uri}")
+
     return Output(
-        value=str(model_path),
+        value=s3_uri,
         metadata={
             "num_feather_files": len(feather_keys),
             "num_rows": len(full_df),
             "mlflow_run_id": run_id,
             "final_test_accuracy": final_test_accuracy,
-            "model_path": str(model_path),
+            "local_model_path": str(model_path),
+            "s3_model_uri": s3_uri,
+            "s3_bucket": S3_BUCKET_NAME,
+            "s3_key": s3_key,
         },
     )
