@@ -438,6 +438,25 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
     chess_data = chess_data[["AN", "WhiteElo"]]
     chess_data = chess_data.reset_index(drop=True)
 
+    def has_at_least_two_moves(an):
+        if not isinstance(an, str):
+            return False
+        moves = create_move_list(an)
+        return len(moves) > 1
+
+    before = len(chess_data)
+    chess_data = chess_data[chess_data["AN"].apply(has_at_least_two_moves)].reset_index(
+        drop=True
+    )
+    after = len(chess_data)
+
+    print(f"Filtered games by length: kept {after} of {before} rows")
+
+    if after == 0:
+        raise ValueError(
+            "No games with at least 2 moves found in dataset (after filtering)."
+        )
+
     if not model_out:
         print("Invalid model out path")
         return
