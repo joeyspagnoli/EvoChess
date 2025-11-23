@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import mlflow
 import mlflow.pytorch
+from typing import Callable, Optional
 
 # Chess columns are notated by a-h, but matrix is noted by #s. Will be used to translate chess columns to matrix equivalent
 letter_to_num = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}
@@ -359,7 +360,13 @@ def train_loop(
     return avg_loss
 
 
-def test_loop(dataloader, model, device, batch_size):
+def test_loop(
+    dataloader,
+    model,
+    device,
+    batch_size,
+    logger: Optional[Callable[[str], None]] = None,
+):
     num_guesses = 0
     correct = 0
     batch_number = 0
@@ -390,6 +397,11 @@ def test_loop(dataloader, model, device, batch_size):
     #             print("num correct", correct)
     #             print(" ")
     accuracy = (correct / num_guesses) * 100
+
+    logger("number of total guesses: ", num_guesses)
+    logger("number of correct guesses: ", correct)
+    logger("accuracy: ", accuracy)
+
     print("number of total guesses: ", num_guesses)
     print("number of correct guesses: ", correct)
     print("accuracy: ", accuracy)
@@ -406,30 +418,44 @@ def get_ai_move(board, model, device):
     return uci
 
 
-def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = None):
+def train(
+    csv_path: str = "",
+    model_out: str = "",
+    df: pd.DataFrame | None = None,
+    logger: Optional[Callable[[str], None]] = None,
+):
+    if logger is None:
+        logger = print
     # read data
     if df is not None:
         chess_data = df.copy()
     else:
         if not csv_path:
             print("Invalid csv path")
+            logger("Invalid csv path")
             return
 
         try:
             chess_data = pd.read_csv(csv_path)
         except Exception as e:
+            logger(f"An error occurred: {e}")
             print(f"An error occurred: {e}")
             return
 
     if chess_data.empty:
+        logger(f"No data found in {csv_path}")
         print(f"No data found in {csv_path}")
         return
 
     if "AN" not in chess_data.columns or "WhiteElo" not in chess_data.columns:
+        logger(f"Data cols not found in {csv_path}")
         print(f"Data cols not found in {csv_path}")
         return
 
     if not chess_data["AN"].notna().any() or not chess_data["WhiteElo"].notna().any():
+        logger(
+            f"Columns AN/WhiteElo are present but contain no valid data in {csv_path}"
+        )
         print(
             f"Columns AN/WhiteElo are present but contain no valid data in {csv_path}"
         )
@@ -450,6 +476,7 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
     )
     after = len(chess_data)
 
+    logger(f"Filtered games by length: kept {after} of {before} rows")
     print(f"Filtered games by length: kept {after} of {before} rows")
 
     if after == 0:
@@ -458,6 +485,7 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
         )
 
     if not model_out:
+        logger("Invalid model out path")
         print("Invalid model out path")
         return
 
@@ -493,7 +521,7 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
 
     learning_rate = 1e-2
     batch_size = 32
-    epochs = 100
+    epochs = 3
 
     metric_from = nn.CrossEntropyLoss()
     metric_to = nn.CrossEntropyLoss()
@@ -516,6 +544,7 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
         mlflow.log_param("test_size", len(test_dataset))
 
         for t in range(epochs):
+            logger(f"Epoch {t + 1}\n-------------------------------")
             print(f"Epoch {t + 1}\n-------------------------------")
             train_loss = train_loop(
                 data_train_loader,
@@ -539,6 +568,7 @@ def train(csv_path: str = "", model_out: str = "", df: pd.DataFrame | None = Non
             if optimizer.param_groups[0]["lr"] > 1e-5:
                 scheduler.step()
 
+        logger("Done")
         print("Done!")
 
         torch.save(model.state_dict(), model_out)

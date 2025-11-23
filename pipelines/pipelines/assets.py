@@ -153,7 +153,7 @@ def filtered_pgn_zst(context: AssetExecutionContext, s3: S3Resource) -> Output[s
                 white_elo_str = game.headers.get("WhiteElo")
                 black_elo_str = game.headers.get("BlackElo")
 
-                if game_counter % 1000 == 0:
+                if game_counter % 100000 == 0:
                     context.log.info(f"Processed {game_counter} games...")
 
                 if (
@@ -300,7 +300,7 @@ def training_chunk_feather(
                 }
             )
 
-            if game_counter % 1000 == 0:
+            if game_counter % 100000 == 0:
                 context.log.info(
                     f"Parsed {game_counter} games from PGN; {len(rows)} rows so far..."
                 )
@@ -390,7 +390,11 @@ def train_evochess_model(
     context.log.info(f"Starting training for partition {partition_key}")
     context.log.info(f"Model will be saved to {model_out}")
 
-    result = train_evochess(csv_path=str(local_csv_path), model_out=str(model_out))
+    result = train_evochess(
+        csv_path=str(local_csv_path),
+        model_out=str(model_out),
+        logger=context.log.info,
+    )
 
     run_id = result.get("run_id")
     final_test_accuracy = result.get("final_test_accuracy")
@@ -487,6 +491,7 @@ def baseline_evochess_model(
     result = train_evochess(
         df=full_df,
         model_out=str(model_out),
+        logger=context.log.info,
     )
 
     run_id = result.get("run_id")
